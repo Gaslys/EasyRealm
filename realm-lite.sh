@@ -7,7 +7,7 @@ Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 Warn="${Red_font_prefix}[警告]${Font_color_suffix}"
 Cyan_font_prefix="\033[36m"
 Bold="\033[1m"
-shell_version="1.0.2"
+shell_version="1.0.3"
 realm_new_ver="2.9.6"
 declare -A realm_sha256=(
   [x86_64-unknown-linux-musl]="b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65"
@@ -258,6 +258,13 @@ CONF
     ((restore_failed)) && config_ok=0
   fi
 
+  if ((restored_rawconf)) && (($(count_rules) == 0)); then
+    warn "rawconf 里没有有效转发规则，保留现有 config.json；当前转发仍按原配置运行"
+    if has_foreign_rules; then
+      warn "rawconf 里只有本脚本不支持的规则类型，未写入 realm 配置"
+    fi
+  fi
+
   # rawconf 是规则源: 恢复后重建一遍, 避免 config.json 缺失或过期导致规则没生效
   if ((restored_rawconf)) && (($(count_rules) > 0)); then
     if rebuild_config; then
@@ -293,16 +300,20 @@ CONF
   fi
 
   echo "------------------------------"
-  if [[ -x /usr/bin/realm && -f /usr/lib/systemd/system/realm.service && -f /etc/realm/config.json ]] && ((start_ok)) && ((config_ok)); then
-    echo "realm安装成功"
-    if ((!restore_failed)); then
-      [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
-    else
-      warn "备份未删除：${backup_dir}"
+  if [[ -x /usr/bin/realm && -f /usr/lib/systemd/system/realm.service && -f /etc/realm/config.json ]]; then
+    if ((start_ok)) && ((config_ok)); then
+      echo "realm安装成功"
+      if ((!restore_failed)); then
+        [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
+      else
+        warn "备份未删除：${backup_dir}"
+      fi
+      return 0
     fi
-    return 0
+    echo "realm 已安装，但配置没有生效，请执行 systemctl status realm 及 journalctl -u realm -n 50 查看原因"
+  else
+    echo "realm没有安装成功，请执行 systemctl status realm 及 journalctl -u realm -n 50 查看原因"
   fi
-  echo "realm没有安装成功，请执行 systemctl status realm 及 journalctl -u realm -n 50 查看原因"
   [[ -n ${backup_dir} ]] && warn "原配置备份保留在 ${backup_dir}"
   return 1
 }
@@ -310,7 +321,7 @@ CONF
 function Uninstall_ct() {
   check_root
   local ans
-  echo -e "${Warn} 即将停止并删除 realm、/etc/realm 下的全部转发配置"
+  echo -e "${Warn} 即将停止并删除 realm、/etc/realm 下的全部文件（含转发配置）"
   read -r -p "确认卸载？[y/N]:" ans
   [[ ${ans} == [Yy] ]] || {
     echo "已取消"
@@ -385,16 +396,33 @@ function valid_host() {
     die "${label}不能包含空格、引号、反斜杠、#、@、/、?、%"
 }
 
+# 已知的其它规则类型: Multi-EasyGost 的 gost.sh 会写入这些 flag_a
+function is_foreign_type() {
+  case "$1" in
+  # gost.sh 实际使用的类型
+  encrypttls | encryptws | encryptwss | peerno | peertls | peerws | peerwss | cdnno | cdnws | cdnwss | decrypttls | decryptws | decryptwss | ss | socks | http) return 0 ;;
+  # 其它常见 gost 类型, 避免误当坏行
+  ssr | socks5 | tls | ws | wss | mtls | mws | mwss | trojan | obfs | obfs4 | obfs-http | obfs-tls | kcp | quic | http2 | h2 | h2c) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # 解析一行 rawconf: nonencrypt/本地端口#目标IP#目标端口
-# 返回 0 正常, 1 行无效, 2 是别的规则类型(gost 完整版脚本写的)
+# 返回 0 正常, 1 行无效, 2 是已知的其它规则类型, 3 是注释/空行
 function parse_rule() {
   local line="${1%$'\r'}" f1 host dport extra
-  [[ -z ${line//[[:space:]]/} ]] && return 1
+  # 去掉首尾空白; 行内空白仍按非法处理
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z ${line} ]] && return 3
+  [[ ${line} == '#'* ]] && return 3
   IFS='#' read -r f1 host dport extra <<<"${line}"
   r_type=${f1%%/*}
   if [[ ${r_type} != "nonencrypt" ]]; then
-    # 只有形如 ss/xxx#...#... 的才算完整版的规则, 其余一律当坏行
-    [[ ${line} == *"#"*"#"* ]] && return 2
+    if is_foreign_type "${r_type}"; then
+      # 只有形如 ss/xxx#...#... 的才算完整版的规则, 其余一律当坏行
+      [[ ${line} == *"#"*"#"* ]] && return 2
+    fi
     return 1
   fi
   [[ -n ${extra} ]] && return 1
@@ -409,6 +437,16 @@ function parse_rule() {
   # 带冒号的必须是 IPv6, 否则 "1.2.3.4:443" 这种会拼出非法地址
   [[ ${r_dhost} == *:* ]] && ! is_ipv6_host "${r_dhost}" && return 1
   return 0
+}
+
+# 菜单 3 显示坏行用: 转义常见控制字符并截断, 避免终端被转义序列影响
+function preview_line() {
+  local s="$1"
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\033'/\\033}
+  (( ${#s} > 60 )) && s="${s:0:60}..."
+  printf '%s' "${s}"
 }
 
 function count_rules() {
@@ -433,11 +471,11 @@ function has_foreign_rules() {
   done <"${raw_conf_path}"
   return 1
 }
-# 本脚本只认 nonencrypt; 混有其它类型时拒绝重建, 否则会把它们写丢
+# 本脚本只认 nonencrypt; 混有已知外来类型时拒绝重建, 注释和坏行不受影响
 function ensure_lite() {
   if has_foreign_rules; then
     warn "检测到 ${raw_conf_path} 里还有本脚本不支持的规则类型（ss / tls / ws 等）"
-    warn "为了不把它们的配置写丢，这里不重建配置；请改用 gost.sh 或手动处理这些行"
+    warn "这些行不会写进 realm 配置；请先用菜单 4 删除它们，或改用 gost.sh 管理"
     return 1
   fi
   return 0
@@ -459,6 +497,7 @@ function rebuild_config() {
     parse_rule "${line}"
     case $? in
     0) ;;
+    3) continue ;;
     2)
       warn "第 ${lineno} 行是其它类型的规则（${r_type}），本脚本不处理，已跳过"
       continue
@@ -695,7 +734,7 @@ function listeners_ok() {
 }
 
 function list_rules() {
-  local line i=0
+  local line i=0 shown
   if [[ ! -f ${raw_conf_path} ]]; then
     warn "还没有任何转发规则，先执行菜单 2 新增"
     return 1
@@ -704,13 +743,31 @@ function list_rules() {
   echo -e "--------------------------------------------------------"
   while IFS= read -r line || [[ -n ${line} ]]; do
     i=$((i + 1))
+    shown=0
     parse_rule "${line}"
     case $? in
-    0) echo -e "  ${i}  | ${r_sport}\t| ${r_dhost}:${r_dport}" ;;
-    2) echo -e "  ${i}  | 其它类型 | ${r_type}（内容已隐藏，请用 gost.sh 管理）" ;;
-    *) [[ -z ${line//[[:space:]]/} ]] || echo -e "  ${i}  | 无法解析 | 内容已隐藏，请手动查看 ${raw_conf_path}" ;;
+    0)
+      echo -e "  ${i}  | ${r_sport}\t| ${r_dhost}:${r_dport}"
+      shown=1
+      ;;
+    2)
+      echo -e "  ${i}  | 其它类型 | ${r_type}（内容已隐藏，可用菜单 4 删除）"
+      shown=1
+      ;;
+    3)
+      if [[ -n ${line//[[:space:]]/} ]]; then
+        printf '  %s  | 注释 | 已忽略\n' "${i}"
+        shown=1
+      fi
+      ;;
+    *)
+      if [[ -n ${line//[[:space:]]/} ]]; then
+        printf '  %s  | 无法解析 | %s\n' "${i}" "$(preview_line "${line}")"
+        shown=1
+      fi
+      ;;
     esac
-    echo -e "--------------------------------------------------------"
+    ((shown)) && echo -e "--------------------------------------------------------"
   done <"${raw_conf_path}"
 }
 
@@ -753,8 +810,7 @@ function add_rule() {
 }
 
 function delete_rule() {
-  local num total=0 ans detail ruleline
-  ensure_lite || return 1
+  local num total=0 ans detail ruleline rc=0
   list_rules || return 1
   read -r -p "请输入要删除的规则序号：" num
   [[ ${num} =~ ^[0-9]+$ ]] || {
@@ -767,12 +823,28 @@ function delete_rule() {
     return 1
   }
   ruleline=$(sed -n "${num}p" "${raw_conf_path}")
-  if parse_rule "${ruleline}"; then
-    detail="本机 ${r_sport} -> ${r_dhost}:${r_dport}"
-  else
-    detail="第 ${num} 行（不是有效规则）"
+  parse_rule "${ruleline}"
+  rc=$?
+  case ${rc} in
+  0) detail="本机 ${r_sport} -> ${r_dhost}:${r_dport}" ;;
+  2) detail="第 ${num} 行，其它类型（${r_type}），内容已隐藏" ;;
+  3)
+    if [[ -z ${ruleline//[[:space:]]/} ]]; then
+      detail="第 ${num} 行，空行"
+    else
+      detail="第 ${num} 行，注释"
+    fi
+    ;;
+  *) detail="第 ${num} 行，无法解析：$(preview_line "${ruleline}")" ;;
+  esac
+
+  # 有真正的外来规则时, 删有效规则会导致重建配置跳过它们; 先让用户删掉那些行
+  if ((rc == 0)) && has_foreign_rules; then
+    warn "rawconf 里还有本脚本不支持的规则类型，请先用菜单 4 删除这些行，再删有效规则"
+    return 1
   fi
-  echo -e "  即将删除：${detail}"
+
+  printf '  即将删除：%s\n' "${detail}"
   read -r -p "确认删除？[y/N]:" ans
   [[ ${ans} == [Yy] ]] || {
     echo "已取消"
@@ -783,6 +855,14 @@ function delete_rule() {
     restore_rawconf
     die "删除失败"
   }
+
+  # 注释/坏行/外来类型不参与 realm 配置, 删掉即可, 不需要重启服务
+  if ((rc != 0)); then
+    commit_rawconf
+    echo -e "${Info} 已删除第 ${num} 行（非规则行），realm 配置未改动"
+    return 0
+  fi
+
   # 删光了就停服务并取消开机启动, 旧配置和规则各留一份 .bak, 免得重启后拿空配置拉起
   if (($(count_rules) == 0)); then
     systemctl stop realm >/dev/null 2>&1
@@ -835,7 +915,7 @@ function show_banner() {
     fi
     rules=$(count_rules)
     if has_foreign_rules; then
-      rules="${rules} 条（另有其它类型规则，请用 gost.sh 管理）"
+      rules="${rules} 条（另有其它类型规则，可用菜单 4 删除）"
     else
       rules="${rules} 条"
     fi
