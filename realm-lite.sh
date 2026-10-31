@@ -7,7 +7,7 @@ Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 Warn="${Red_font_prefix}[警告]${Font_color_suffix}"
 Cyan_font_prefix="\033[36m"
 Bold="\033[1m"
-shell_version="1.0.1"
+shell_version="1.0.2"
 realm_new_ver="2.9.6"
 declare -A realm_sha256=(
   [x86_64-unknown-linux-musl]="b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65"
@@ -102,8 +102,9 @@ function Installation_dependency() {
   fi
   command -v tar >/dev/null 2>&1 || pkgs+=(tar)
   command -v gzip >/dev/null 2>&1 || pkgs+=(gzip)
-  # 端口归属校验依赖完整的 ss; busybox 的 ss 不支持 -H/-p 时也换成 iproute2
-  if ! command -v ss >/dev/null 2>&1 || ! ss -H -ltn >/dev/null 2>&1; then
+  # 端口归属校验依赖完整的 ss; busybox 的 ss 不支持 -p 时换成 iproute2
+  # 老版本 iproute2 没有 -H, 用 ss_out 的回退路径处理
+  if ! command -v ss >/dev/null 2>&1 || ! ss -ltnp >/dev/null 2>&1; then
     pkgs+=(iproute2)
   fi
   ((${#pkgs[@]})) || return 0
@@ -597,12 +598,22 @@ function listen_port_taken() {
   return 1
 }
 
+# 取 ss 输出并去掉表头。老版本 iproute2 没有 -H, 回退到 tail -n +2
+function ss_out() {
+  local out
+  if ss -H "$@" 2>/dev/null; then
+    return 0
+  fi
+  out=$(ss "$@" 2>/dev/null) || return 1
+  printf '%s\n' "${out}" | tail -n +2
+}
+
 # 端口是否已被任何进程监听(realm 自己也算)。realm 绑不上端口时不会退出,
 # 只会在日志里 panic, 所以新增前必须自己查, 不能指望 is-active 兜底。
 function port_in_use() {
   local port="$1" addr
   if command -v ss >/dev/null 2>&1; then
-    for addr in $(ss -H -ltn 2>/dev/null | awk '{print $4}') $(ss -H -lun 2>/dev/null | awk '{print $4}'); do
+    for addr in $(ss_out -ltn | awk '{print $4}') $(ss_out -lun | awk '{print $4}'); do
       [[ ${addr} == *":${port}" ]] && return 0
     done
     return 1
@@ -643,9 +654,9 @@ function listened_by_realm() {
   local p="$1" proto out line addr found
   for proto in tcp udp; do
     if [[ ${proto} == tcp ]]; then
-      out=$(ss -H -ltnp 2>/dev/null) || return 0
+      out=$(ss_out -ltnp) || return 1
     else
-      out=$(ss -H -lunp 2>/dev/null) || return 0
+      out=$(ss_out -lunp) || return 1
     fi
     found=0
     while IFS= read -r line; do
@@ -667,7 +678,13 @@ function listeners_ok() {
   local p
   failed_port=""
   (($#)) || return 0
-  command -v ss >/dev/null 2>&1 || return 0
+  if ! command -v ss >/dev/null 2>&1; then
+    if ((${ss_warned:-0} == 0)); then
+      warn "没有 ss，无法核对端口是否由 realm 监听，仅检查服务状态"
+      ss_warned=1
+    fi
+    return 0
+  fi
   for p in "$@"; do
     if ! listened_by_realm "${p}"; then
       failed_port="${p}"
@@ -736,7 +753,7 @@ function add_rule() {
 }
 
 function delete_rule() {
-  local line num total=0
+  local num total=0 ans detail ruleline
   ensure_lite || return 1
   list_rules || return 1
   read -r -p "请输入要删除的规则序号：" num
@@ -747,6 +764,18 @@ function delete_rule() {
   total=$(awk 'END{print NR}' "${raw_conf_path}" 2>/dev/null)
   ((10#${num} >= 1 && 10#${num} <= ${total:-0})) || {
     echo "请输入正确数字"
+    return 1
+  }
+  ruleline=$(sed -n "${num}p" "${raw_conf_path}")
+  if parse_rule "${ruleline}"; then
+    detail="本机 ${r_sport} -> ${r_dhost}:${r_dport}"
+  else
+    detail="第 ${num} 行（不是有效规则）"
+  fi
+  echo -e "  即将删除：${detail}"
+  read -r -p "确认删除？[y/N]:" ans
+  [[ ${ans} == [Yy] ]] || {
+    echo "已取消"
     return 1
   }
   snapshot_rawconf
