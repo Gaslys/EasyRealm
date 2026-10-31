@@ -45,15 +45,15 @@ chmod +x realm-lite.sh
 | `/etc/realm/rawconf` | 规则源文件，每行一条 |
 | `/usr/lib/systemd/system/realm.service` | systemd unit |
 
-`rawconf` 每行的格式与 `gost-lite.sh` 相同：
+`rawconf` 每行一条，格式同 `gost-lite.sh`：
 
 ```text
 nonencrypt/本地端口#目标地址#目标端口
 ```
 
-例如 `nonencrypt/8080#1.2.3.4#443`，表示本机 8080 端口的 TCP 和 UDP 都转发到 `1.2.3.4:443`。IPv6 目标写成 `nonencrypt/8080#[2001:db8::1]#443`，手写成不带方括号的地址也可以，重建时会自动补上。
+例如 `nonencrypt/8080#1.2.3.4#443`，表示本机 8080 的 TCP、UDP 都转发到 `1.2.3.4:443`。IPv6 写成 `nonencrypt/8080#[2001:db8::1]#443`。
 
-从 gost-lite 迁移时，把 `/etc/gost/rawconf` 里的 `nonencrypt` 行复制到 `/etc/realm/rawconf`，再执行菜单 5 即可。混有 `ss`、`tls` 等其它类型时脚本会拒绝重建，避免把那些规则写丢。
+迁移时把 `/etc/gost/rawconf` 的 `nonencrypt` 行复制到 `/etc/realm/rawconf`，执行菜单 5。混有 `ss`、`tls` 等类型时，脚本会拒绝重建，避免写丢。
 
 ## 支持架构
 
