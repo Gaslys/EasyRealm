@@ -7,8 +7,18 @@ Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 Warn="${Red_font_prefix}[警告]${Font_color_suffix}"
 Cyan_font_prefix="\033[36m"
 Bold="\033[1m"
-shell_version="1.0.0"
+shell_version="1.0.1"
 realm_new_ver="2.9.6"
+declare -A realm_sha256=(
+  [x86_64-unknown-linux-musl]="b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65"
+  [aarch64-unknown-linux-musl]="f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488"
+  [armv7-unknown-linux-musleabihf]="ceedaf367c78f911eac227b2b88b3132f964d05a8b71f7a6a7e429dc78ec1862"
+  [arm-unknown-linux-musleabihf]="2e83ca031a96aa171df45f9d929807cd8d2671384698ae2ab54a62d6c347c48c"
+  [mips-unknown-linux-musl]="f3753ea292e26bc06717f3e676f0fb61b9fc16c9f92dc7cbcd8e19e4b8bf1fa9"
+  [mipsel-unknown-linux-musl]="e441b6348116d81c213d0e1962a113a60534588e1aac04f524b741203e2dbc55"
+  [mips64-unknown-linux-muslabi64]="3907216877f42170fba5986dd27755ef3c769907bab62f06285f52eb334dd690"
+  [mips64el-unknown-linux-muslabi64]="6e082f9d1830c058d61e7d3804fb89692e173c932b71a2404acd45f146c6d92f"
+)
 realm_conf_path="/etc/realm/config.json"
 raw_conf_path="/etc/realm/rawconf"
 
@@ -86,9 +96,16 @@ function download() {
 
 function Installation_dependency() {
   local -a pkgs=()
-  command -v wget >/dev/null 2>&1 || pkgs+=(wget)
+  # wget 和 curl 有一个能下载就够了
+  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    pkgs+=(wget)
+  fi
   command -v tar >/dev/null 2>&1 || pkgs+=(tar)
   command -v gzip >/dev/null 2>&1 || pkgs+=(gzip)
+  # 端口归属校验依赖完整的 ss; busybox 的 ss 不支持 -H/-p 时也换成 iproute2
+  if ! command -v ss >/dev/null 2>&1 || ! ss -H -ltn >/dev/null 2>&1; then
+    pkgs+=(iproute2)
+  fi
   ((${#pkgs[@]})) || return 0
   echo -e "${Info} 缺少依赖: ${pkgs[*]}，正在安装 ..."
   if command -v apt-get >/dev/null 2>&1; then
@@ -106,10 +123,10 @@ function check_file() {
   [[ -d /usr/lib/systemd/system ]] || mkdir -p /usr/lib/systemd/system || die "无法创建 /usr/lib/systemd/system，当前系统可能没有 systemd"
 }
 
+# 只清理脚本自己安装的文件; /etc/realm 里可能有用户自己放的东西, 不整个删掉
 function check_nor_file() {
   rm -f /usr/bin/realm
   rm -f /usr/lib/systemd/system/realm.service
-  rm -rf /etc/realm
 }
 
 # 先下载、解压、跑 realm -v 校验, 全部通过后才动旧文件
@@ -119,7 +136,9 @@ function Install_ct() {
   check_file
   check_sys
 
-  local bin_url tmpdir backup_dir="" ans
+  local bin_url tmpdir backup_dir="" ans restored_rawconf=0 restored_config=0 restore_failed=0 config_ok=1 start_ok=0
+  local got want
+  local -a cports=()
   bin_url="https://github.com/zhboner/realm/releases/download/v${realm_new_ver}/realm-${realm_asset}.tar.gz"
 
   if [[ -x /usr/bin/realm || -f /usr/lib/systemd/system/realm.service || -d /etc/realm ]]; then
@@ -141,6 +160,17 @@ function Install_ct() {
     rm -rf "${tmpdir}"
     [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
     die "realm 下载失败，现有安装未改动"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    want="${realm_sha256[${realm_asset}]}"
+    got=$(sha256sum "${tmpdir}/realm.tar.gz" | awk '{print $1}')
+    if [[ -z ${want} || ${got} != "${want}" ]]; then
+      rm -rf "${tmpdir}"
+      [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
+      die "realm 压缩包 SHA256 校验失败（期望 ${want:-未知}，实际 ${got}），已中止安装，现有安装未改动"
+    fi
+  else
+    warn "系统没有 sha256sum，已跳过压缩包校验，仅校验版本号"
   fi
   if ! tar -xzf "${tmpdir}/realm.tar.gz" -C "${tmpdir}"; then
     rm -rf "${tmpdir}"
@@ -204,29 +234,76 @@ CONF
 
   if [[ -n ${backup_dir} ]]; then
     if [[ -f "${backup_dir}/rawconf" ]]; then
-      install -m 0644 "${backup_dir}/rawconf" "${raw_conf_path}" || warn "恢复 rawconf 失败"
-      [[ -f "${backup_dir}/config.json" ]] && { install -m 0600 "${backup_dir}/config.json" "${realm_conf_path}" || warn "恢复 config.json 失败"; }
-      echo -e "${Info} 已恢复原有转发配置"
-    elif [[ -f "${backup_dir}/config.json" ]]; then
-      # 没有 rawconf 说明这份配置不是本脚本写的, 原样保留, 不能拿默认配置覆盖
-      install -m 0600 "${backup_dir}/config.json" "${realm_conf_path}" || warn "恢复 config.json 失败"
-      warn "没有找到 ${raw_conf_path}，已保留原 config.json；脚本暂时无法列出这些规则"
+      if install -m 0644 "${backup_dir}/rawconf" "${raw_conf_path}"; then
+        restored_rawconf=1
+      else
+        restore_failed=1
+        warn "恢复 rawconf 失败，备份保留在 ${backup_dir}"
+      fi
     fi
+    if [[ -f "${backup_dir}/config.json" ]]; then
+      if install -m 0600 "${backup_dir}/config.json" "${realm_conf_path}"; then
+        restored_config=1
+      else
+        restore_failed=1
+        warn "恢复 config.json 失败，备份保留在 ${backup_dir}"
+      fi
+    fi
+    if ((restored_rawconf || restored_config)); then
+      echo -e "${Info} 已恢复原有转发配置"
+    elif ((!restore_failed)); then
+      warn "备份里没有 rawconf 或 config.json，保留默认配置"
+    fi
+    ((restore_failed)) && config_ok=0
   fi
 
-  [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
+  # rawconf 是规则源: 恢复后重建一遍, 避免 config.json 缺失或过期导致规则没生效
+  if ((restored_rawconf)) && (($(count_rules) > 0)); then
+    if rebuild_config; then
+      echo -e "${Info} 已按 rawconf 重建配置"
+    else
+      warn "rawconf 已恢复，但配置重建失败，本次启动可能没有应用这些规则；请执行菜单 5 检查"
+      config_ok=0
+    fi
+  fi
   rm -rf "${tmpdir}"
 
   systemctl daemon-reload
   systemctl enable realm >/dev/null 2>&1
-  systemctl restart realm
-  sleep 1
-  echo "------------------------------"
-  if [[ -x /usr/bin/realm && -f /usr/lib/systemd/system/realm.service && -f /etc/realm/config.json ]] && systemctl is-active --quiet realm; then
-    echo "realm安装成功"
+  if ((restored_rawconf)) && ((config_ok)) && (($(count_rules) > 0)); then
+    if restart_realm; then
+      start_ok=1
+    fi
   else
-    echo "realm没有安装成功，请执行 systemctl status realm 及 journalctl -u realm -n 50 查看原因"
+    systemctl restart realm
+    sleep 1
+    if systemctl is-active --quiet realm; then
+      if ((restored_config)); then
+        mapfile -t cports < <(config_ports)
+        if listeners_ok "${cports[@]}"; then
+          start_ok=1
+        else
+          warn "config.json 里的端口没有全部由 realm 监听，请检查端口占用"
+        fi
+      else
+        start_ok=1
+      fi
+    fi
   fi
+
+  echo "------------------------------"
+  if [[ -x /usr/bin/realm && -f /usr/lib/systemd/system/realm.service && -f /etc/realm/config.json ]] && ((start_ok)) && ((config_ok)); then
+    echo "realm安装成功"
+    if ((!restore_failed)); then
+      [[ -n ${backup_dir} ]] && rm -rf "${backup_dir}"
+    else
+      warn "备份未删除：${backup_dir}"
+    fi
+    return 0
+  fi
+  echo "realm没有安装成功，请执行 systemctl status realm 及 journalctl -u realm -n 50 查看原因"
+  [[ -n ${backup_dir} ]] && warn "原配置备份保留在 ${backup_dir}"
+  return 1
 }
 
 function Uninstall_ct() {
@@ -432,7 +509,12 @@ function rebuild_config() {
   fi
   chmod 0600 "${tmp}"
   if [[ -f ${target} ]]; then
-    cp -a "${target}" "${target}.bak" 2>/dev/null && chmod 0600 "${target}.bak" 2>/dev/null
+    if ! cp -a "${target}" "${target}.bak" 2>/dev/null; then
+      warn "无法备份上一份配置 ${target}.bak，已中止重建"
+      rm -f "${tmp}"
+      return 1
+    fi
+    chmod 0600 "${target}.bak" 2>/dev/null
   else
     # 没有"上一份配置"时清掉旧 .bak: 否则这次重启失败会回滚到一份无关的旧配置,
     # 比如刚删光的规则被复活
@@ -450,8 +532,10 @@ function rebuild_config() {
 # 重启并确认真的起来了; 起不来就回滚, 避免一条坏规则把所有转发带下去
 # realm 绑端口失败时进程不退出, 所以除了 is-active 还要核对每个端口是否真的在监听
 function restart_realm() {
-  local bak="${realm_conf_path}.bak" ports=()
+  local bak="${realm_conf_path}.bak" ports=() old_ports=()
   mapfile -t ports < <(raw_ports)
+  # 删光规则时服务被 disable 过, 再次新增/重启时恢复开机启动
+  systemctl enable realm >/dev/null 2>&1
   systemctl restart realm
   sleep 1
   if systemctl is-active --quiet realm && listeners_ok "${ports[@]}"; then
@@ -466,7 +550,9 @@ function restart_realm() {
     cp -a "${bak}" "${realm_conf_path}" && chmod 0600 "${realm_conf_path}"
     systemctl restart realm
     sleep 1
-    if systemctl is-active --quiet realm; then
+    # 回滚后的配置也要核对端口, 不能只看进程还活着
+    mapfile -t old_ports < <(config_ports)
+    if systemctl is-active --quiet realm && listeners_ok "${old_ports[@]}"; then
       warn "已回滚，本次改动未生效；请检查端口是否被其它程序占用后重试"
       return 1
     fi
@@ -543,6 +629,12 @@ function raw_ports() {
     seen+="${p} "
     echo "${p}"
   done <"${raw_conf_path}"
+}
+
+# 从 config.json 里提取 listen 端口, 没有 rawconf 时用它核对监听
+function config_ports() {
+  [[ -f ${realm_conf_path} ]] || return 0
+  grep '"listen"' "${realm_conf_path}" 2>/dev/null | grep -o ':[0-9]\{1,5\}"' | tr -d ':"' | sort -u
 }
 
 # 某个端口的 tcp/udp 监听者是不是 realm 自己
@@ -639,6 +731,7 @@ function add_rule() {
     list_rules
   else
     restore_rawconf
+    return 1
   fi
 }
 
@@ -661,12 +754,14 @@ function delete_rule() {
     restore_rawconf
     die "删除失败"
   }
-  # 删光了就停服务, 旧配置留作 .bak, 免得菜单 5 又把刚删的规则拉起来
+  # 删光了就停服务并取消开机启动, 旧配置和规则各留一份 .bak, 免得重启后拿空配置拉起
   if (($(count_rules) == 0)); then
     systemctl stop realm >/dev/null 2>&1
+    systemctl disable realm >/dev/null 2>&1
+    [[ -n ${raw_conf_snap} ]] && cp -a "${raw_conf_snap}" "${raw_conf_path}.bak" 2>/dev/null
     [[ -f ${realm_conf_path} ]] && mv -f "${realm_conf_path}" "${realm_conf_path}.bak" 2>/dev/null
     commit_rawconf
-    echo -e "${Info} 规则已全部删除，realm 服务已停止"
+    echo -e "${Info} 规则已全部删除，realm 服务已停止并取消开机启动（规则备份在 rawconf.bak）"
     return 0
   fi
   if rebuild_config && restart_realm; then
@@ -675,6 +770,7 @@ function delete_rule() {
     list_rules
   else
     restore_rawconf
+    return 1
   fi
   return 0
 }
@@ -690,6 +786,7 @@ function restart_all() {
     echo -e "${Info} 已按 rawconf 重建配置并重启"
   else
     warn "rawconf 没有改动，请修正 ${raw_conf_path} 后重试（本次重启未生效）"
+    return 1
   fi
 }
 
